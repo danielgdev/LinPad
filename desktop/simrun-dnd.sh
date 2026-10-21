@@ -26,8 +26,8 @@ if [ $# -gt 0 ] && [ "$1" != "--" ]; then SHOT=$1; shift; fi
 ROOTFS=${ROOTFS:-rootfs-gui-arm64.tar.gz}
 
 if [ -z "${NOBUILD:-}" ]; then
-    if ! xcodebuild -skipMacroValidation -project iSH.xcodeproj -target iSH-ARM64 -configuration Release \
-            -sdk iphonesimulator ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SYMROOT="$PWD/build-sim-dnd" \
+    if ! xcodebuild -skipMacroValidation -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release \
+            -destination 'generic/platform=iOS Simulator' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SYMROOT="$PWD/build-sim-dnd" \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO \
             ${AUTOMATION:+SWIFT_ACTIVE_COMPILATION_CONDITIONS=DESKTOP_AUTOMATION} build > "$BUILD_LOG" 2>&1; then
         grep -E "^[^ ].*error:" "$BUILD_LOG" | sort -u | head -30

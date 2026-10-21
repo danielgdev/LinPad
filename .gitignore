@@ -29,6 +29,8 @@ e2e_out/
 /perf/
 release/out/
 gpu/build/
+# meson cross files: build-third-party.sh writes them with this Mac's SDK and paths
+gpu/cross/
 gpu/downloads/
 gpu/pkgs/
 gpu/prefix-*/

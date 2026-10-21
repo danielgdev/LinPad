@@ -146,7 +146,7 @@ ENT=$OUT_DIR/entitlements
 if [ -z "$IPA" ]; then
     BUILD_NUMBER=$(git rev-list --count HEAD)
     note "building $VERSION ($BUILD_NUMBER): Release, native JIT, virtgpu"
-    run xcodebuild -skipMacroValidation -project iSH.xcodeproj -target iSH-ARM64 -configuration Release -sdk iphoneos \
+    run xcodebuild -skipMacroValidation -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release -destination 'generic/platform=iOS' \
         SYMROOT="$BUILD_DIR" IPHONEOS_DEPLOYMENT_TARGET=$MIN_OS ISH_JIT_BUILD=enabled ISH_VIRTGPU=enabled \
         MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= build

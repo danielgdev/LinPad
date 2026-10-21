@@ -29,7 +29,7 @@ To rebuild from scratch:
 ```sh
 cd /Volumes/ExternalHD/Dev/ish-arm64
 export PATH=/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:$PATH
-xcodebuild -skipMacroValidation -project iSH.xcodeproj -target iSH-ARM64 -configuration Release -sdk iphoneos \
+xcodebuild -skipMacroValidation -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release -destination 'generic/platform=iOS' \
   -allowProvisioningUpdates SYMROOT=$PWD/build-ios-release IPHONEOS_DEPLOYMENT_TARGET=16.0 \
   DEVELOPMENT_TEAM=<TEAM_ID> ISH_JIT_BUILD=enabled build
 release/embed-rootfs.sh --device "build-ios-release/Release-iphoneos/iSH ARM64.app" \
@@ -119,8 +119,9 @@ The iPad must be in landscape, with the Logitech keyboard and trackpad attached.
      afterwards.
 9. **Memory.** Turn on Settings › Desktop › Performance overlay (it shows phys_footprint).
    - With Firefox, Thunar and foot open, the simulator measured about 1.5–2 GB.
-   - This build lacks the increased-memory-limit entitlement (see CHECKLIST.md), so
-     jetsam may kill the app around 3 GB on an 8 GB iPad.
+   - A source build signed with Xcode has the increased-memory-limit and
+     extended-virtual-addressing entitlements (`app/iSH.entitlements`). The release IPA
+     has neither, so jetsam may kill it around 3 GB on an 8 GB iPad.
    - Note when that happens and what was open.
 
 ## 3b. Native JIT ("fast mode") on the iPad
@@ -240,6 +241,11 @@ through Files:
 
 - The native JIT without StikDebug. Without StikDebug and LocalDevVPN set up, every
   launch uses the gadget engine, and the app says why (Settings › Fast Mode).
-- `com.apple.developer.kernel.increased-memory-limit`. It needs the updated Apple Program
-  License Agreement accepted at developer.apple.com first. Then add it to
-  `app/iSH.entitlements` and rebuild; Xcode refreshes the profile automatically.
+- Nothing else is missing for an Xcode-signed build. `app/iSH.entitlements` asks for
+  `com.apple.developer.kernel.increased-memory-limit` (jetsam headroom) and
+  `com.apple.developer.kernel.extended-virtual-addressing`. Without the second, a busy
+  system exhausts the app's roughly 7.5 GB of address space and the emulator's next
+  allocation fails. Both need a paid team that has accepted Apple's current Program
+  License Agreement; `-allowProvisioningUpdates` then adds them to the App ID and profile.
+  The release IPA (release/publish.sh) keeps its own entitlement list without them, so
+  SideStore and AltStore installs with free Apple IDs are unaffected.
