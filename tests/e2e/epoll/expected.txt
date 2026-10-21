@@ -1,0 +1,60 @@
+pty: add 10 IN: ok
+pty: add 11 OUT: ok
+pty: add 10 again: EEXIST
+pty idle: OUT 2
+pty input: IN 1, OUT 2
+pty: mod 11 IN: ok
+pty mod: IN 1, IN 2
+pty: del 10: ok
+pty del: IN 2
+sock: add a IN: ok
+sock: add b OUT: ok
+sock: add a again: EEXIST
+sock idle: OUT 6
+sock input: IN 5, OUT 6
+sock: del b: ok
+sock: del b again: ENOENT
+sock del: IN 5
+fanout: add LT: ok
+fanout: add ET: ok
+fanout both: IN 10, IN 11
+fanout both: prompt
+fanout: del LT: ok
+fanout ET only: IN 11
+fanout ET only: prompt
+fanout: re-add LT: ok
+fanout: del ET: ok
+fanout LT only: IN 10
+fanout LT only: prompt
+oneshot: add: ok
+oneshot fire: IN 20
+oneshot disabled: none
+oneshot: add again: EEXIST
+oneshot: mod: ok
+oneshot rearmed: IN 20
+oneshot: mod: ok
+oneshot wake: IN 20
+oneshot wake: prompt
+oneshot disabled: none
+oneshot et: mod: ok
+oneshot et fire: IN 20
+oneshot et: mod: ok
+oneshot et still ready: IN 20
+eventfd: add: ok
+eventfd fire: IN 3
+eventfd disabled: none
+eventfd: add again: EEXIST
+eventfd: mod: ok
+eventfd rearmed: IN 3
+maxevents 1: 1 then 1, data sum 61
+maxevents 1 third: none
+close: add a: ok
+close a: IN 7
+close: del a: EBADF
+close: number reused: yes
+close: add new: ok
+close both: IN 7, IN 8
+close b: none
+close new: IN 8
+close new: prompt
+select: 1 r=1 x=0 prompt

@@ -38,6 +38,13 @@ struct poll {
 struct poll_fd {
     // locked by containing struct poll
     struct fd *fd;
+    // The guest fd number this interest was added under. Linux keys epoll
+    // interest by (open file description, fd number), so fds 0 and 1 sharing
+    // one tty description are two items, each with its own events and data.
+    int fdnum;
+    // A fired EPOLLONESHOT item: kept in the set (EPOLL_CTL_MOD re-arms it,
+    // EPOLL_CTL_ADD is EEXIST), but reports nothing.
+    bool disabled;
     struct list fds;
     int types;
     union poll_fd_info {
@@ -76,10 +83,12 @@ struct poll_event {
     int types;
 };
 struct poll *poll_create(void);
-bool poll_has_fd(struct poll *poll, struct fd *fd);
-int poll_add_fd(struct poll *poll, struct fd *fd, int types, union poll_fd_info info);
-int poll_mod_fd(struct poll *poll, struct fd *fd, int types, union poll_fd_info info);
-int poll_del_fd(struct poll *poll, struct fd *fd);
+// fdnum is the guest fd number fd was looked up by; (fd, fdnum) is the key.
+// poll_add_fd returns _EEXIST if that pair is already in the poll, and
+// poll_mod_fd/poll_del_fd return _ENOENT if it is not.
+int poll_add_fd(struct poll *poll, struct fd *fd, int fdnum, int types, union poll_fd_info info);
+int poll_mod_fd(struct poll *poll, struct fd *fd, int fdnum, int types, union poll_fd_info info);
+int poll_del_fd(struct poll *poll, struct fd *fd, int fdnum);
 // Indicates that the specified events have been triggered. Each call will
 // generate a new edge-triggered notification.
 // please do not call this while holding any locks you would acquire in your poll operation
