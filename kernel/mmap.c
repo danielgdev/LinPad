@@ -456,10 +456,30 @@ int_t sys_mprotect(addr_t addr, addr_t len, int_t prot) {
     return err;
 }
 
-dword_t sys_madvise(addr_t addr, dword_t len, dword_t advice) {
-    STRACE("madvise(0x%llx, 0x%x, %d)", (unsigned long long)addr, len, advice);
-    if ((advice == 4 /* MADV_DONTNEED */ || advice == 8 /* MADV_FREE */) && len > 0)
-        mem_discard(current->mem, PAGE(addr), PAGE(addr + len - 1) - PAGE(addr) + 1);
+dword_t sys_madvise(addr_t addr, addr_t len, dword_t advice) {
+    STRACE("madvise(0x%llx, 0x%llx, %d)", (unsigned long long)addr, (unsigned long long)len, advice);
+    if (!(advice == 4 /* MADV_DONTNEED */ || advice == 8 /* MADV_FREE */) || len == 0)
+        return 0;
+    if (addr + len - 1 < addr)
+        return _EINVAL;
+    page_t start = PAGE(addr);
+    page_t last = PAGE(addr + len - 1);
+    if (last >= MEM_PAGES)
+        return _ENOMEM;
+    if (advice == 8) {
+        // Linux only frees private anonymous memory lazily: MADV_FREE on a file
+        // or shared mapping is EINVAL (callers fall back to MADV_DONTNEED).
+        read_wrlock(&current->mem->lock);
+        for (page_t page = start; page <= last; mem_next_page(current->mem, &page)) {
+            struct pt_entry *entry = mem_pt(current->mem, page);
+            if (entry != NULL && (!(entry->flags & P_ANONYMOUS) || (entry->flags & P_SHARED))) {
+                read_wrunlock(&current->mem->lock);
+                return _EINVAL;
+            }
+        }
+        read_wrunlock(&current->mem->lock);
+    }
+    mem_discard(current->mem, start, last - start + 1);
     return 0;
 }
 

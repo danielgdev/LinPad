@@ -304,10 +304,14 @@ void handle_interrupt(int interrupt) {
             //       would do — an adjacent V8-owned page is enough
             //       confidence this isn't a wild pointer.
             bool in_v8_cage = false;
+            bool in_prot_none_reservation = false;
 #ifdef GUEST_ARM64
             read_wrlock(&current->mem->lock);
-            if (mem_find_reservation(current->mem, PAGE(cpu->segfault_addr)) != NULL)
+            struct mem_reservation *fault_res = mem_find_reservation(current->mem, PAGE(cpu->segfault_addr));
+            if (fault_res != NULL) {
                 in_v8_cage = true;
+                in_prot_none_reservation = !(fault_res->flags & P_RWX);
+            }
             read_wrunlock(&current->mem->lock);
             if (!in_v8_cage &&
                 cpu->segfault_addr >= 0xb0000000ULL &&
@@ -324,6 +328,10 @@ void handle_interrupt(int interrupt) {
             bool allow_demand_map = !cpu->segfault_was_write;
             if (cpu->segfault_was_write && in_v8_cage)
                 allow_demand_map = true;
+            // An untouched page of a PROT_NONE reservation faults like any
+            // PROT_NONE page; mapping it here would quietly make it accessible.
+            if (in_prot_none_reservation)
+                allow_demand_map = false;
 
             if (allow_demand_map) {
                 page_t fault_page = PAGE(cpu->segfault_addr);
@@ -798,7 +806,15 @@ void handle_interrupt(int interrupt) {
             // mapped) but crash in iSH (because we have unmapped gaps).
             // Rate-limited to prevent infinite loops on true null-pointer derefs.
 #ifdef GUEST_ARM64
-            if (!cpu->segfault_was_write) {
+            // Only for unmapped memory: a PROT_NONE page (mapped, or inside a
+            // reservation) is a guard the guest put there, and must get its
+            // SIGSEGV as on Linux (musl's brk guard, V8/JSC guard regions).
+            bool fault_unmapped;
+            read_wrlock(&current->mem->lock);
+            fault_unmapped = mem_pt(current->mem, PAGE(cpu->segfault_addr)) == NULL &&
+                mem_find_reservation(current->mem, PAGE(cpu->segfault_addr)) == NULL;
+            read_wrunlock(&current->mem->lock);
+            if (!cpu->segfault_was_write && fault_unmapped) {
                 static _Thread_local int read_recovery_count = 0;
                 static _Thread_local addr_t last_recovery_addr = 0;
                 // Reset counter when faulting address changes (scanner moving through memory)

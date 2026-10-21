@@ -65,7 +65,7 @@ struct fd;
 addr_t mmap_file(addr_t addr, uint64_t len, dword_t prot, dword_t flags, struct fd *file);
 int_t sys_mprotect(addr_t addr, addr_t len, int_t prot);
 addr_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags);
-dword_t sys_madvise(addr_t addr, dword_t len, dword_t advice);
+dword_t sys_madvise(addr_t addr, addr_t len, dword_t advice);
 dword_t sys_mbind(addr_t addr, dword_t len, int_t mode, addr_t nodemask, dword_t maxnode, uint_t flags);
 int_t sys_mlock(addr_t addr, dword_t len);
 int_t sys_msync(addr_t addr, dword_t len, int_t flags);
