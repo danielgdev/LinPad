@@ -479,14 +479,23 @@ static struct proc_dir_entry proc_pid_fd;
 
 static bool proc_pid_fd_readdir(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry) {
     struct task *task = proc_get_task(entry);
+    // A readdir callback returns "more entries", not an errno: the old
+    // `return _ESRCH` read as true and the caller used an unset next_entry.
     if (task == NULL)
-        return _ESRCH;
-    lock(&task->files->lock);
-    while (*index < task->files->size && task->files->files[*index] == NULL)
+        return false;
+    // An exiting task drops its fd table (exit.c sets files = NULL) before it
+    // counts as exiting, so lsof racing an exit locked a NULL table.
+    struct fdtable *files = task->files;
+    if (files == NULL) {
+        proc_put_task(task);
+        return false;
+    }
+    lock(&files->lock);
+    while (*index < files->size && files->files[*index] == NULL)
         (*index)++;
     fd_t f = (*index)++;
-    bool any_left = (unsigned) f < task->files->size;
-    unlock(&task->files->lock);
+    bool any_left = (unsigned) f < files->size;
+    unlock(&files->lock);
     proc_put_task(task);
     *next_entry = (struct proc_entry) {&proc_pid_fd, .pid = entry->pid, .fd = f};
     return any_left;
