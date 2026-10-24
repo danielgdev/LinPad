@@ -1,8 +1,9 @@
 #!/bin/sh
 # CPU smoke run for CI, a few minutes on Apple Silicon. For each engine (JIT, then the
 # interpreter): the run.sh conformance tests built with gcc inside the guest and diffed
-# against the host, the guest-only SMC, host-page-protection, PROT_NONE, madvise and
-# unlink-of-a-directory checks, and difffuzz on a fixed corpus from gen_fuzz_words.py.
+# against the host, the guest-only SMC, host-page-protection, PROT_NONE, madvise,
+# unlink-of-a-directory and socket-timeout checks, and difffuzz on a fixed corpus from
+# gen_fuzz_words.py.
 #   ISH=build/ish FAKEFS=/path/to/fakefs tests/arm64-insn/smoke.sh
 # FAKEFS is an Alpine aarch64 fakefs with gcc and musl-dev installed. The ish binary
 # must be built with -Djit=enabled for the JIT pass to exercise the JIT.
@@ -26,7 +27,7 @@ guest_build() { # name: copies tests/arm64-insn/<name>.c into the guest and buil
 }
 
 echo "== building guest-only tests and difffuzz"
-for t in smc hostprot protnone madvise_file unlink_dir difffuzz; do guest_build "$t"; done
+for t in smc hostprot protnone madvise_file unlink_dir so_timeo difffuzz; do guest_build "$t"; done
 cc -O1 -o "$OUT/difffuzz-native" "$HERE/difffuzz.c"
 python3 "$HERE/gen_fuzz_words.py" > "$OUT/words.txt"
 "$OUT/difffuzz-native" < "$OUT/words.txt" > "$OUT/fuzz-native.txt"
@@ -44,7 +45,7 @@ for engine in jit interp; do
     for t in $tests; do
         OUT=$OUT/$engine sh "$HERE/run.sh" "$t" || failed=1
     done
-    for t in smc hostprot protnone madvise_file unlink_dir; do
+    for t in smc hostprot protnone madvise_file unlink_dir so_timeo; do
         result=$(guest "/root/insn/$t") || true
         if [ "$result" = "$t ok" ]; then echo "$t: ok"; else echo "$t: FAILED ($result)"; failed=1; fi
     done
