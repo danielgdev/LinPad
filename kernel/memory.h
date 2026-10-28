@@ -131,7 +131,8 @@ struct pt_entry {
     unsigned flags;
 };
 // page flags
-// P_READ and P_EXEC are ignored for now
+// A page with none of P_RWX (PROT_NONE) can't be accessed at all; otherwise P_READ
+// and P_EXEC are not enforced.
 #define P_READ (1 << 0)
 #define P_WRITE (1 << 1)
 #undef P_EXEC // defined in sys/proc.h on darwin
@@ -190,7 +191,8 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type);
 int mem_segv_reason(struct mem *mem, addr_t addr);
 
 extern size_t real_page_size;
-// madvise(MADV_DONTNEED/MADV_FREE): zero the pages and give their memory back to the host.
+// madvise(MADV_DONTNEED/MADV_FREE): zero the anonymous pages and give their memory back to
+// the host. Private file pages keep their contents.
 void mem_discard(struct mem *mem, page_t start, pages_t pages);
 
 #endif

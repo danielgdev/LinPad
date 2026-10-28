@@ -210,6 +210,13 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
+    // Linux says EISDIR for unlink of a directory, the host (Darwin) EPERM. Bun's
+    // recursive rm, among others, only switches to rmdir on EISDIR.
+    if (err == _EPERM) {
+        struct statbuf stat;
+        if (mount->fs->stat(mount, path, &stat) >= 0 && S_ISDIR(stat.mode))
+            err = _EISDIR;
+    }
     mount_release(mount);
     if (notify && err >= 0)
         fsnotify_delete(full, false);

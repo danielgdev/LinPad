@@ -96,13 +96,62 @@ static inline int poll_fd_real_types(struct poll_fd *pollfd, int types) {
 }
 
 // does not do its own locking
-static struct poll_fd *poll_find_fd(struct poll *poll, struct fd *fd) {
+static struct poll_fd *poll_find_fd(struct poll *poll, struct fd *fd, int fdnum) {
     struct poll_fd *poll_fd, *tmp;
     list_for_each_entry_safe(&poll->poll_fds, poll_fd, tmp, fds) {
-        if (poll_fd->fd == fd)
+        if (poll_fd->fd == fd && poll_fd->fdnum == fdnum)
             return poll_fd;
     }
     return NULL;
+}
+
+// The host keys a registration by host fd (kqueue: (ident, filter); epoll:
+// the fd), and re-adding one replaces its udata, so all poll_fds of one struct
+// fd in this poll (fds 0 and 1 of a dup'd pipe or socket) share one host
+// registration: the union of their types, udata = the first of them (the
+// anchor). Readiness is still decided per poll_fd by fd->ops->poll in
+// poll_wait; the host event is only a wakeup plus edge-trigger bookkeeping,
+// which poll_host_event fans out to every sibling.
+//
+// Known limitation: the host edge-trigger flag (EV_CLEAR/EPOLLET) is only set
+// when every sibling is edge-triggered. With a level-triggered sibling, an
+// edge-triggered one effectively becomes level-triggered: the undrained host
+// event fires on every wait and re-arms its edge, so it is reported again on
+// each epoll_wait while ready. Nothing is missed and nothing hangs. ttys are
+// not host-backed and never hit this.
+//
+// Caller holds poll->lock.
+static int poll_sync_real(struct poll *poll, struct fd *fd) {
+    struct poll_fd *poll_fd, *anchor = NULL;
+    int types = 0;
+    bool all_et = true;
+    list_for_each_entry(&poll->poll_fds, poll_fd, fds) {
+        if (poll_fd->fd != fd || poll_fd->disabled)
+            continue;
+        if (anchor == NULL)
+            anchor = poll_fd;
+        types |= poll_fd_real_types(poll_fd, poll_fd->types);
+        if (!(poll_fd->types & POLL_EDGETRIGGERED))
+            all_et = false;
+    }
+    // drop ONESHOT, ET and guest-only bits (EPOLLRDHUP etc.) from the union
+    types &= POLL_READ | POLL_PRI | POLL_WRITE | POLL_ERR | POLL_HUP;
+    if (anchor != NULL && all_et && !poll_fd_is_epoll(anchor))
+        types |= POLL_EDGETRIGGERED;
+    return real_poll_update(&poll->real, fd->real_fd, types, anchor);
+}
+
+// A host event for the registration anchored at `anchor`: give every
+// edge-triggered poll_fd of that struct fd a new edge. Caller holds poll->lock.
+static void poll_host_event(struct poll *poll, struct poll_fd *anchor, int events) {
+    // NULL is the notify pipe; a poll_fd on the freelist has poll == NULL
+    if (anchor == NULL || anchor->poll != poll)
+        return;
+    struct poll_fd *poll_fd;
+    list_for_each_entry(&poll->poll_fds, poll_fd, fds) {
+        if (poll_fd->fd == anchor->fd && poll_fd->types & POLL_EDGETRIGGERED)
+            poll_fd->triggered_types &= ~events;
+    }
 }
 
 // See comment on pollfd_freelist for context
@@ -113,14 +162,15 @@ static void poll_fd_free(struct poll_fd *poll_fd) {
     list_add(&poll->pollfd_freelist, &poll_fd->fds);
 }
 
-bool poll_has_fd(struct poll *poll, struct fd *fd) {
-    return poll_find_fd(poll, fd) != NULL;
-}
-
-int poll_add_fd(struct poll *poll, struct fd *fd, int types, union poll_fd_info info) {
+int poll_add_fd(struct poll *poll, struct fd *fd, int fdnum, int types, union poll_fd_info info) {
     int err;
     lock(&fd->poll_lock);
     lock(&poll->lock);
+    // checked under the lock so that two racing ADDs cannot both succeed
+    if (poll_find_fd(poll, fd, fdnum) != NULL) {
+        err = _EEXIST;
+        goto out;
+    }
 
     struct poll_fd *poll_fd;
     if (!list_empty(&poll->pollfd_freelist)) {
@@ -134,22 +184,23 @@ int poll_add_fd(struct poll *poll, struct fd *fd, int types, union poll_fd_info 
         }
     }
     poll_fd->fd = fd;
+    poll_fd->fdnum = fdnum;
+    poll_fd->disabled = false;
     poll_fd->poll = poll;
     poll_fd->types = types;
     poll_fd->info = info;
     poll_fd->triggered_types = 0;
 
-    if (poll_fd_is_real(poll_fd)) {
-        err = real_poll_update(&poll->real, fd->real_fd, poll_fd_real_types(poll_fd, types), poll_fd);
-        if (err < 0) {
-            free(poll_fd);
-            err = errno_map();
-            goto out;
-        }
-    }
-
     list_add(&fd->poll_fds, &poll_fd->polls);
     list_add(&poll->poll_fds, &poll_fd->fds);
+    if (poll_fd_is_real(poll_fd) && poll_sync_real(poll, fd) < 0) {
+        err = errno_map();
+        list_remove(&poll_fd->polls);
+        list_remove(&poll_fd->fds);
+        poll_fd_free(poll_fd);
+        poll_sync_real(poll, fd); // restore the siblings' registration
+        goto out;
+    }
 
     err = 0;
 out:
@@ -158,27 +209,24 @@ out:
     return err;
 }
 
-int poll_del_fd(struct poll *poll, struct fd *fd) {
+int poll_del_fd(struct poll *poll, struct fd *fd, int fdnum) {
     int err;
     lock(&fd->poll_lock);
     lock(&poll->lock);
-    struct poll_fd *poll_fd = poll_find_fd(poll, fd);
+    struct poll_fd *poll_fd = poll_find_fd(poll, fd, fdnum);
     if (poll_fd == NULL) {
         err = _ENOENT;
         goto out;
     }
 
-    if (poll_fd_is_real(poll_fd)) {
-        err = real_poll_update(&poll->real, fd->real_fd, 0, poll_fd);
-        if (err < 0) {
-            err = errno_map();
-            goto out;
-        }
-    }
-
+    bool real = poll_fd_is_real(poll_fd);
     list_remove(&poll_fd->polls);
     list_remove(&poll_fd->fds);
     poll_fd_free(poll_fd);
+    // shrink the shared host registration to the remaining siblings (and
+    // re-anchor it), or delete it if this was the last one
+    if (real)
+        poll_sync_real(poll, fd);
 
     err = 0;
 out:
@@ -187,27 +235,26 @@ out:
     return err;
 }
 
-int poll_mod_fd(struct poll *poll, struct fd *fd, int types, union poll_fd_info info) {
+int poll_mod_fd(struct poll *poll, struct fd *fd, int fdnum, int types, union poll_fd_info info) {
     int err;
     lock(&fd->poll_lock);
     lock(&poll->lock);
-    struct poll_fd *poll_fd = poll_find_fd(poll, fd);
+    struct poll_fd *poll_fd = poll_find_fd(poll, fd, fdnum);
     if (poll_fd == NULL) {
         err = _ENOENT;
         goto out;
-    }
-
-    if (poll_fd_is_real(poll_fd)) {
-        err = real_poll_update(&poll->real, fd->real_fd, poll_fd_real_types(poll_fd, types), poll_fd);
-        if (err < 0) {
-            err = errno_map();
-            goto out;
-        }
     }
 
     poll_fd->types = types;
     poll_fd->info = info;
-    poll_fd->triggered_types &= types;
+    // Linux re-polls the file on MOD and reports it if it is still ready,
+    // edge-triggered or not, so forget the edges already reported
+    poll_fd->triggered_types = 0;
+    poll_fd->disabled = false; // re-arms a fired EPOLLONESHOT item, as on Linux
+    if (poll_fd_is_real(poll_fd) && poll_sync_real(poll, fd) < 0) {
+        err = errno_map();
+        goto out;
+    }
 
     err = 0;
 out:
@@ -219,6 +266,9 @@ out:
 void poll_cleanup_fd(struct fd *fd) {
     lock(&fd->poll_lock);
     struct poll_fd *poll_fd, *tmp;
+    // Last close of the description: every sibling (fd, fdnum) item goes, in
+    // every poll, so the shared host registration is simply deleted (the
+    // second delete for a sibling in the same poll is a harmless ENOENT).
     list_for_each_entry_safe(&fd->poll_fds, poll_fd, tmp, polls) {
         lock(&poll_fd->poll->lock);
         if (poll_fd_is_real(poll_fd))
@@ -287,18 +337,14 @@ int epoll_fd_poll(struct fd *fd) {
         int n;
         do {
             n = real_poll_wait(&poll->real, e, sizeof(e) / sizeof(e[0]), &zero);
-            for (int i = 0; i < n; i++) {
-                struct poll_fd *triggered = rpe_data(&e[i]);
-                if (triggered != NULL && triggered->poll != NULL &&
-                        triggered->types & POLL_EDGETRIGGERED)
-                    triggered->triggered_types &= ~rpe_events(&e[i]);
-            }
+            for (int i = 0; i < n; i++)
+                poll_host_event(poll, rpe_data(&e[i]), rpe_events(&e[i]));
         } while (n == (int) (sizeof(e) / sizeof(e[0])));
     }
     struct poll_fd *poll_fd;
     list_for_each_entry(&poll->poll_fds, poll_fd, fds) {
         struct fd *member = poll_fd->fd;
-        if (member == fd || member->ops->poll == NULL)
+        if (member == fd || member->ops->poll == NULL || poll_fd->disabled)
             continue;
         int types = member->ops->poll(member);
         types &= poll_fd->types | POLL_HUP | POLL_ERR;
@@ -335,6 +381,8 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         struct poll_fd *poll_fd, *tmp;
         list_for_each_entry_safe(&poll_->poll_fds, poll_fd, tmp, fds) {
             struct fd *fd = poll_fd->fd;
+            if (poll_fd->disabled)
+                continue;
             int poll_types = 0;
             if (fd->ops->poll)
                 poll_types = fd->ops->poll(fd);
@@ -343,25 +391,25 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 poll_types &= ~poll_fd->triggered_types;
             }
             if (poll_types) {
-                if (callback(context, poll_types, poll_fd->info) == 1)
-                    res++;
-
-                // The real poll does not actually get the FDs set as oneshot.
-                // But this loop is done while holding the lock, so only one
-                // thread can get each oneshot event. This doesn't solve the
-                // thundering herd problem at all, but at least the semantics
-                // are right. I'll just leave that as a TODO.
-                if (poll_fd->types & POLL_ONESHOT) {
-                    list_remove(&poll_fd->polls);
-                    list_remove(&poll_fd->fds);
-                    if (poll_fd_is_real(poll_fd)) {
-                        real_poll_update(&poll_->real, fd->real_fd, 0, NULL);
-                    }
-                    free(poll_fd);
-                }
+                // not delivered (epoll maxevents reached): leave it armed for
+                // the next wait
+                if (callback(context, poll_types, poll_fd->info) != 1)
+                    continue;
+                res++;
 
                 if (poll_fd->types & POLL_EDGETRIGGERED) {
                     poll_fd->triggered_types |= poll_types;
+                }
+
+                // The real poll does not actually get the FDs set as oneshot.
+                // But this loop is done while holding the lock, so only one
+                // thread can get each oneshot event. Like Linux, a fired
+                // oneshot item is disabled, not removed: EPOLL_CTL_MOD re-arms
+                // it and EPOLL_CTL_ADD is EEXIST.
+                if (poll_fd->types & POLL_ONESHOT) {
+                    poll_fd->disabled = true;
+                    if (poll_fd_is_real(poll_fd))
+                        poll_sync_real(poll_, fd);
                 }
             }
         }
@@ -458,14 +506,9 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             break;
         }
 
-        // dead with any edge-triggered notifications
-        for (int i = 0; i < err; i++) {
-            struct poll_fd *triggered_poll_fd = rpe_data(&e[i]);
-            if (triggered_poll_fd != NULL && triggered_poll_fd->poll != NULL &&
-                    triggered_poll_fd->types & POLL_EDGETRIGGERED) {
-                triggered_poll_fd->triggered_types &= ~rpe_events(&e[i]);
-            }
-        }
+        // deal with any edge-triggered notifications
+        for (int i = 0; i < err; i++)
+            poll_host_event(poll_, rpe_data(&e[i]), rpe_events(&e[i]));
 
         char fuck;
         if (read(poll_->notify_pipe[0], &fuck, 1) < 0 && errno != EAGAIN) {
@@ -527,8 +570,14 @@ static int real_poll_wait(struct real_poll *real, struct real_poll_event *events
 
 static int real_poll_update(struct real_poll *real, int fd, int types, void *data) {
     types &= ~EPOLLONESHOT;
-    if (types == 0)
-        return epoll_ctl(real->fd, EPOLL_CTL_DEL, fd, NULL);
+    if (types == 0) {
+        // nothing registered yet (an item with no events, or a sibling of
+        // a registration already deleted) is not an error, as with kqueue
+        int err = epoll_ctl(real->fd, EPOLL_CTL_DEL, fd, NULL);
+        if (err < 0 && errno == ENOENT)
+            err = 0;
+        return err;
+    }
     struct epoll_event epevent = {.events = types, .data.ptr = data};
     int err = epoll_ctl(real->fd, EPOLL_CTL_MOD, fd, &epevent);
     if (err < 0 && errno == ENOENT)

@@ -185,7 +185,7 @@ export PATH=/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:$PATH
 gpu/build-third-party.sh          # virglrenderer + MoltenVK (once)
 release/build-rootfs.sh           # the Alpine system image (~50 min)
 
-xcodebuild -skipMacroValidation -project iSH.xcodeproj -target iSH-ARM64 -configuration Release -sdk iphoneos \
+xcodebuild -skipMacroValidation -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release -destination 'generic/platform=iOS' \
   -allowProvisioningUpdates SYMROOT=$PWD/build-ios-release IPHONEOS_DEPLOYMENT_TARGET=16.0 \
   DEVELOPMENT_TEAM=<your team> ISH_JIT_BUILD=enabled build
 

@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <string.h>
@@ -32,6 +33,15 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     fd->socket.domain = domain;
     fd->socket.type = type & SOCKET_TYPE_MASK;
     fd->socket.protocol = protocol;
+#if defined(SO_NP_EXTENSIONS)
+    // Darwin rejects every setsockopt with EINVAL once a socket can neither
+    // send nor receive (e.g. its unix peer has closed); Linux allows it, and
+    // Rust programs set SO_RCVTIMEO on connections the peer may already have
+    // closed. Best effort. A socket accepted after its peer closed fails this
+    // call itself, but it inherits the flag from its listener, which got it here.
+    struct so_np_extensions npx = {SONPX_SETOPTSHUT, SONPX_SETOPTSHUT};
+    setsockopt(sock_fd, SOL_SOCKET, SO_NP_EXTENSIONS, &npx, sizeof(npx));
+#endif
     if (domain == AF_LOCAL_) {
         cond_init(&fd->socket.unix_got_peer);
         list_init(&fd->socket.unix_scm);
@@ -159,7 +169,11 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
             lock(&fs->lock);
             mode &= ~fs->umask;
             unlock(&fs->lock);
-            err = mount->fs->mknod(mount, path, S_IFSOCK | mode, 0);
+            // Not every filesystem has mknod (tmpfs doesn't); Linux's tmpfs
+            // would create the socket, here it fails instead of crashing.
+            err = _EPERM;
+            if (mount->fs->mknod)
+                err = mount->fs->mknod(mount, path, S_IFSOCK | mode, 0);
             if (err < 0)
                 goto out;
             err = mount->fs->stat(mount, path, &stat);
@@ -836,12 +850,16 @@ error:
 }
 
 // Read a socket timeout option as milliseconds. Returns 0 if unset or error.
+// Rounds up, so a sub-millisecond timeout still expires (as on Linux, where it
+// becomes one jiffy), and treats one too long to count in ms as no timeout.
 static long sock_get_timeout_ms(int real_fd, int optname) {
     struct timeval tv = {0, 0};
     socklen_t len = sizeof(tv);
     if (getsockopt(real_fd, SOL_SOCKET, optname, &tv, &len) < 0)
         return 0;
-    return (long)tv.tv_sec * 1000L + (long)tv.tv_usec / 1000L;
+    if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_sec >= LONG_MAX / 4000)
+        return 0;
+    return (long)tv.tv_sec * 1000L + ((long)tv.tv_usec + 999L) / 1000L;
 }
 
 static long monotonic_ms(void) {
@@ -874,11 +892,10 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
         int poll_ms = 1000;
         if (deadline_ms > 0) {
             long remaining = deadline_ms - monotonic_ms();
-            if (remaining <= 0) {
-                ish_printk_diag("NETDIAG sock_wait(pid=%d comm=%s fd=%d ev=%#x) deadline-expired after %ldms\n",
-                       current->pid, current->comm, real_fd, events, timeout_ms);
+            // An expired SO_RCVTIMEO is normal (programs loop on it), so it
+            // isn't logged: it would flood the diagnostic ring.
+            if (remaining <= 0)
                 return _EAGAIN;
-            }
             if (remaining < poll_ms)
                 poll_ms = (int)remaining;
         }
@@ -1070,6 +1087,60 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
 
 #define DEFAULT_TCP_CONGESTION "cubic"
 
+// SO_RCVTIMEO/SO_SNDTIMEO (both numberings, see fs/sock.h): returns the host
+// option and sets *guest_size to the size of the guest's timeval, or returns 0
+// for any other option.
+static int sock_timeo_opt(dword_t level, dword_t option, size_t *guest_size) {
+    if (level != SOL_SOCKET_)
+        return 0;
+    switch (option) {
+        case SO_RCVTIMEO_OLD_: *guest_size = 2 * sizeof(time_t_); return SO_RCVTIMEO;
+        case SO_SNDTIMEO_OLD_: *guest_size = 2 * sizeof(time_t_); return SO_SNDTIMEO;
+        case SO_RCVTIMEO_NEW_: *guest_size = 2 * sizeof(sqword_t); return SO_RCVTIMEO;
+        case SO_SNDTIMEO_NEW_: *guest_size = 2 * sizeof(sqword_t); return SO_SNDTIMEO;
+    }
+    return 0;
+}
+
+// The checks of Linux's sock_set_timeout, then the host timeval.
+static int sock_timeo_from_guest(const char *value, size_t value_len, size_t guest_size, struct timeval *tv) {
+    if (value_len < guest_size)
+        return _EINVAL;
+    int64_t sec, usec;
+    if (guest_size == 2 * sizeof(sqword_t)) {
+        sqword_t v[2];
+        memcpy(v, value, sizeof(v));
+        sec = v[0], usec = v[1];
+    } else {
+        sdword_t v[2];
+        memcpy(v, value, sizeof(v));
+        sec = v[0], usec = v[1];
+    }
+    if (usec < 0 || usec >= 1000000)
+        return _EDOM;
+    if (sec < 0) {
+        // Linux stores a zero timeout, so a blocking call fails at once with
+        // EAGAIN. Darwin would refuse it (EDOM); use the shortest timeout.
+        sec = 0, usec = 1;
+    } else if (sec >= LONG_MAX / 1000 - 1) {
+        // Linux treats a timeout this long as none, and reports it as {0, 0}.
+        sec = 0, usec = 0;
+    }
+    tv->tv_sec = (time_t) sec;
+    tv->tv_usec = (suseconds_t) usec;
+    return 0;
+}
+
+static void sock_timeo_to_guest(const struct timeval *tv, size_t guest_size, char *value) {
+    if (guest_size == 2 * sizeof(sqword_t)) {
+        sqword_t v[2] = {tv->tv_sec, tv->tv_usec};
+        memcpy(value, v, sizeof(v));
+    } else {
+        sdword_t v[2] = {(sdword_t) tv->tv_sec, (sdword_t) tv->tv_usec};
+        memcpy(value, v, sizeof(v));
+    }
+}
+
 int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
     STRACE("setsockopt(%d, %d, %d, 0x%x, %d)", sock_fd, level, option, value_addr, value_len);
     struct fd *sock = sock_getfd(sock_fd);
@@ -1102,6 +1173,17 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         return _ENOENT;
     }
 #endif
+    size_t timeo_size;
+    int timeo_opt = sock_timeo_opt(level, option, &timeo_size);
+    if (timeo_opt != 0) {
+        struct timeval tv;
+        int err = sock_timeo_from_guest(value, value_len, timeo_size, &tv);
+        if (err < 0)
+            return err;
+        if (setsockopt(sock->real_fd, SOL_SOCKET, timeo_opt, &tv, sizeof(tv)) < 0)
+            return errno_map();
+        return 0;
+    }
 
     int real_opt = sock_opt_to_real(option, level);
     if (real_opt < 0)
@@ -1133,7 +1215,20 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
 
-    if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
+    size_t timeo_size;
+    int timeo_opt = sock_timeo_opt(level, option, &timeo_size);
+    if (timeo_opt != 0) {
+        struct timeval tv;
+        socklen_t tv_len = sizeof(tv);
+        if (getsockopt(sock->real_fd, SOL_SOCKET, timeo_opt, &tv, &tv_len) < 0)
+            return errno_map();
+        char guest_tv[16];
+        sock_timeo_to_guest(&tv, timeo_size, guest_tv);
+        // Like Linux, a short buffer gets a truncated value, not an error.
+        if (value_len > timeo_size)
+            value_len = timeo_size;
+        memcpy(value, guest_tv, value_len);
+    } else if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
         dword_t *value_p = (dword_t *) value;
         if (value_len != sizeof(*value_p))
             return _EINVAL;

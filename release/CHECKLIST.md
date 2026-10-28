@@ -12,7 +12,7 @@ trackpad, touch). Install steps are in `release/INSTALL-DEVICE.md`. Test evidenc
 | Rootfs (shareable) | `release/build-rootfs.sh` → `release/out/ish-linux-rootfs-arm64.tar.gz` + `.version` + `SIZES-*.txt` | built: **589 MiB** (617 MB) compressed, 2.24 GiB unpacked, 216,952 entries, version 202610020508 |
 | Rootfs with VS Code (local testing only, never publish) | `VSCODE=1 release/build-rootfs.sh` → `ipad-jit/release-work/ish-linux-rootfs-vscode-arm64.tar.gz` | built: 901 MiB, version 202610020522; it contains Microsoft's binary and stays in ipad-jit/ (not tested in the simulator this round) |
 | Simulator app | `xcodebuild … -sdk iphonesimulator SYMROOT=$PWD/build-sim-rel` then `release/embed-rootfs.sh APP ROOTFS` | built, tested (below) |
-| Device app | the `-sdk iphoneos` command in INSTALL-DEVICE.md, then `release/embed-rootfs.sh --device APP ROOTFS` | built with `ISH_JIT_BUILD=enabled`; rootfs embedded; `codesign -v --strict` ok; the profile lists the iPad. **Not installed** |
+| Device app | the device `xcodebuild` command in INSTALL-DEVICE.md, then `release/embed-rootfs.sh --device APP ROOTFS` | built with `ISH_JIT_BUILD=enabled`; rootfs embedded; `codesign -v --strict` ok; the profile lists the iPad. **Not installed** |
 | End-to-end test | `release/ReleaseHarness` (XCUITest against the installed app) | run on a fresh simulator; results below |
 | DesktopKit unit tests | `xcodebuild test -scheme DesktopKit` | 49/49 pass |
 
@@ -303,10 +303,10 @@ What was cut to get under 700 MB, and why:
 
 ## Pending
 
-1. **`com.apple.developer.kernel.increased-memory-limit`**: blocked until the account holder
-   accepts Apple's updated Program License Agreement on developer.apple.com.
-   - Then add the key to `app/iSH.entitlements` and rebuild with `-allowProvisioningUpdates`.
-   - Re-check that the profile has the capability.
+1. **`com.apple.developer.kernel.increased-memory-limit`** and
+   **`extended-virtual-addressing`**: in `app/iSH.entitlements` for Xcode-signed builds
+   (verified on an iPad Pro M1 with a paid team). The release IPA still lacks both.
+   - Re-check that the profile has the capabilities after a team change.
 2. **JIT on hardware.** It is compiled in and was verified in the simulator (both engines
    boot the desktop). It has not run on a TXM device yet: run INSTALL-DEVICE.md §3b first.
 3. **First test on the iPad**: import time, GPU (Venus on Apple M3), memory under Firefox,

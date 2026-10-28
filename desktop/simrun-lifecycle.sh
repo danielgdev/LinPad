@@ -27,8 +27,8 @@ AUTO=/tmp/ish-automation/$SIM
 ARGS=(-desktop.debugAutomation YES -lifecycle.mockLocationAccess denied)
 
 if [ -z "${NOBUILD:-}" ]; then
-    if ! xcodebuild -skipMacroValidation -project iSH.xcodeproj -target iSH-ARM64 -configuration Release \
-            -sdk iphonesimulator ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SYMROOT="$BUILD" \
+    if ! xcodebuild -skipMacroValidation -project iSH.xcodeproj -scheme iSH-ARM64 -configuration Release \
+            -destination 'generic/platform=iOS Simulator' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SYMROOT="$BUILD" \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS=DESKTOP_AUTOMATION build > "$OUT/build.log" 2>&1; then
         grep -E "^[^ ].*error:" "$OUT/build.log" | sort -u | head -30

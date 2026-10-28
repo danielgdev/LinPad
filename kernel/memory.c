@@ -929,6 +929,11 @@ static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
     struct pt_entry *entry = mem_pt(mem, PAGE(addr));
     if (entry == NULL || (entry->flags & P_PAST_EOF))
         return NULL;
+    // A PROT_NONE page faults on any access, as on Linux. Its host memory is
+    // often PROT_NONE too (pt_map_nothing), so handing out the pointer made the
+    // gadget take a host SIGBUS that killed the app (musl's brk guard page).
+    if (!(entry->flags & P_RWX) && type != MEM_WRITE_PTRACE)
+        return NULL;
     if (type == MEM_WRITE && !P_WRITABLE(entry->flags))
         return NULL;
     return entry->data->data + entry->offset + PGOFFSET(addr);
@@ -1064,7 +1069,9 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 
 check_reservation: ;
         struct mem_reservation *res = mem_find_reservation(mem, page);
-        if (res == NULL)
+        // An untouched page of a PROT_NONE reservation faults too: don't
+        // materialise a host PROT_NONE page whose pointer would be dereferenced.
+        if (res == NULL || !(res->flags & P_RWX))
             return NULL;
         read_wrunlock(&mem->lock);
         // BLOCKING: avoid NULL → INT_GPF retry (which re-runs the JIT
@@ -1240,7 +1247,7 @@ void mem_coredump(struct mem *mem, const char *file) {
     close(fd);
 }
 
-// madvise(MADV_DONTNEED / MADV_FREE): the pages must read as zero afterwards, and their
+// madvise(MADV_DONTNEED / MADV_FREE): anonymous pages must read as zero afterwards, and their
 // memory should go back to the host. Zeroing them with memset did the opposite: it dirtied
 // every page of the range, including pages the guest never touched, and V8 discards large
 // ranges all the time (VS Code: 5.4 GB footprint).
@@ -1248,8 +1255,8 @@ void mem_coredump(struct mem *mem, const char *file) {
 //    instead of being copied first and then cleared.
 //  - Host pages (16 KB on Apple silicon, four guest pages) whose guest pages are all being
 //    discarded, or no longer use them, are replaced with fresh zero pages, a run at a time.
-//  - What is left (part of a host page still in use, private file mappings) is cleared in
-//    place. Shared mappings are left alone.
+//  - What is left (part of a host page still in use) is cleared in place. Shared mappings
+//    and private file mappings are left alone.
 // One write lock for the whole range, like munmap: other threads stop once, not per page.
 static void discard_host_run(struct mem *mem, char *host, size_t size, page_t first, pages_t count) {
     if (size == 0)
@@ -1273,7 +1280,8 @@ void mem_discard(struct mem *mem, page_t start, pages_t pages) {
     for (page_t page = start; page < end; ) {
         struct pt_entry *entry = mem_pt(mem, page);
         if (entry == NULL) {
-            page++;
+            // skip unpopulated page-table nodes: V8/JSC discard multi-GB reservations
+            mem_next_page(mem, &page);
             continue;
         }
         unsigned flags = entry->flags;
@@ -1337,10 +1345,12 @@ void mem_discard(struct mem *mem, page_t start, pages_t pages) {
                 continue;
             }
         }
-        if (flags & P_COW) {
-            // A private file page still shared with a forked process: Linux
-            // would show the file's contents again, which it still has
-            // unless it was written before the fork. Leave it.
+        if (!(flags & P_ANONYMOUS)) {
+            // A private file page keeps its contents. Linux reads it back from
+            // the file, which gives the same bytes for a page the guest never
+            // wrote; Bun discards its embedded .bun sources this way and then
+            // lexes them again. Deviation: a page the guest wrote keeps the
+            // guest's data instead of going back to the file's.
             page++;
             continue;
         }
